@@ -4,8 +4,9 @@ pub fn present() -> String {
         .unwrap_or_default().trim().to_string()
 }
 
-/// 检测 CPU 集群，返回 (大核列表, 中核列表, 小核列表, 拓扑描述)
-pub fn detect() -> (String, String, String, String) {
+/// 检测 CPU 集群，返回 (大核, 中核高, 中核低, 小核, 拓扑描述)
+/// 2 层: mid1/mid2 空; 3 层: mid1=中间层, mid2 空; 4 层: mid1/mid2 各一层
+pub fn detect() -> (String, String, String, String, String) {
     let mut cls: Vec<(u64, Vec<usize>)> = Vec::new();
     // 方法1: cpufreq policy 目录
     if let Ok(dir) = std::fs::read_dir("/sys/devices/system/cpu/cpufreq") {
@@ -63,14 +64,13 @@ pub fn detect() -> (String, String, String, String) {
             }
         }
     }
-    if cls.is_empty() { return ("0".into(), "".into(), "0".into(), "1".into()); }
+    if cls.is_empty() { return ("0".into(), "".into(), "".into(), "0".into(), "1".into()); }
     let big = fmt_cpus(&cls[0].1);
     let little = fmt_cpus(&cls.last().unwrap().1);
-    let mid = if cls.len() >= 3 {
-        fmt_cpus(&cls[1].1)  // 第二高频集群作为中核
-    } else { "".to_string() };
+    let mid1 = if cls.len() >= 3 { fmt_cpus(&cls[1].1) } else { "".to_string() };
+    let mid2 = if cls.len() >= 4 { fmt_cpus(&cls[2].1) } else { "".to_string() };
     let topo = cls.iter().map(|(_, c)| c.len().to_string()).collect::<Vec<_>>().join("+");
-    (big, mid, little, topo)
+    (big, mid1, mid2, little, topo)
 }
 
 fn fmt_cpus(cpus: &[usize]) -> String {

@@ -1,8 +1,14 @@
-use std::{fs, io::Write};
+use std::{fs, io::Write, sync::atomic::{AtomicUsize, Ordering}};
 
 pub const PATH: &str = "/sdcard/Android/Aether/threads_log.txt";
+const MAX_SIZE: u64 = 512 * 1024;
+const CHECK_EVERY: usize = 512;
 
-pub fn write(level: &str, msg: &str) {
+/// 写入计数，每 CHECK_EVERY 行检查一次文件大小（避免每行 stat）
+static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// 统一日志格式: [I] MM-DD HH:MM:SS: message
+pub fn write(level: char, msg: &str) {
     let mut now: libc::time_t = 0;
     // SAFETY: tm 是 POD 零初始化安全；time()/localtime_r() 可重入，无数据竞争
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -10,10 +16,21 @@ pub fn write(level: &str, msg: &str) {
         libc::time(&mut now);
         libc::localtime_r(&now, &mut tm);
     }
-    let line = format!("[{:02}:{:02}:{:02}][{}] {}\n", tm.tm_hour, tm.tm_min, tm.tm_sec, level, msg);
+    let line = format!(
+        "[{}] {:02}-{:02} {:02}:{:02}:{:02}: {}\n",
+        level, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, msg
+    );
+
     let _ = std::io::stderr().write_all(line.as_bytes());
-    if let Ok(m) = fs::metadata(PATH) {
-        if m.len() > 524288 { let _ = fs::write(PATH, ""); }
+
+    // 每 CHECK_EVERY 行检查一次文件大小，超限轮转（保留最近一份 .old）
+    let n = WRITE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % CHECK_EVERY == 0 {
+        if let Ok(m) = fs::metadata(PATH) {
+            if m.len() > MAX_SIZE {
+                let _ = fs::rename(PATH, format!("{}.old", PATH));
+            }
+        }
     }
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(PATH) {
         let _ = f.write_all(line.as_bytes());
@@ -21,6 +38,8 @@ pub fn write(level: &str, msg: &str) {
 }
 
 #[macro_export]
-macro_rules! info  { ($($a:tt)*) => { $crate::log::write("INFO", &format!($($a)*)) }; }
+macro_rules! info  { ($($a:tt)*) => { $crate::log::write('I', &format!($($a)*)) }; }
 #[macro_export]
-macro_rules! error { ($($a:tt)*) => { $crate::log::write("ERROR", &format!($($a)*)) }; }
+macro_rules! warn  { ($($a:tt)*) => { $crate::log::write('W', &format!($($a)*)) }; }
+#[macro_export]
+macro_rules! error { ($($a:tt)*) => { $crate::log::write('E', &format!($($a)*)) }; }

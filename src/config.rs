@@ -35,6 +35,29 @@ pub struct AppConfig {
     pub mtime: SystemTime,
     pub ebpf: bool,
     pub topo: crate::cpuset::CpuTopology,
+    /// asoul 兼容豁免集合：检测到 asoul 模块时，名单内包名完全不干扰
+    pub asoul_ignore: HashSet<String>,
+}
+
+/// 检测 asoul 模块是否安装（其守护进程以 /data/adb/asoul_affinity_opt 为根）
+pub fn asoul_detected() -> bool {
+    std::path::Path::new("/data/adb/asoul_affinity_opt").exists()
+}
+
+/// 读取 asoul 兼容名单（每行一个包名，# 开头为注释），仅在 asoul 模块存在时读取
+pub fn asoul_gamelist() -> HashSet<String> {
+    if !asoul_detected() {
+        return HashSet::new();
+    }
+    std::fs::read_to_string("/sdcard/Android/Aether/gamelist")
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl AppConfig {
@@ -101,12 +124,31 @@ impl AppConfig {
         }
 
         let mt = fs::metadata(path).ok()?.modified().ok()?;
-        Some(AppConfig { rules, pkg_set, wild, mtime: mt, ebpf, topo: topo.clone() })
+        let mut cfg = AppConfig {
+            rules, pkg_set, wild, mtime: mt, ebpf, topo: topo.clone(),
+            asoul_ignore: HashSet::new(),
+        };
+        cfg.apply_asoul_ignore();
+        Some(cfg)
     }
 
     /// 该包是否存在线程级规则
     pub fn pkg_has_thread_rules(&self, pkg: &str) -> bool {
         self.rules.iter().any(|r| !r.thread.is_empty() && fnmatch(&r.pkg, pkg))
+    }
+
+    /// 应用 asoul 豁免：过滤规则/包名/通配，返回是否发生豁免
+    pub fn apply_asoul_ignore(&mut self) -> bool {
+        let ignore = asoul_gamelist();
+        if ignore.is_empty() { return false; }
+        let n_before = self.rules.len();
+        self.rules.retain(|r| !ignore.contains(&r.pkg));
+        self.pkg_set.retain(|p| !ignore.contains(p));
+        self.wild.retain(|w| !ignore.contains(w));
+        self.asoul_ignore = ignore;
+        crate::info!("asoul compat: ignoring {} pkgs (filtered {} rules)",
+            self.asoul_ignore.len(), n_before - self.rules.len());
+        true
     }
 }
 
@@ -140,7 +182,7 @@ pub mod cache {
                 }
             }
         }
-        info!("已加载 {} 条缓存", seen_pkgs.len());
+        info!("cache entries loaded: {}", seen_pkgs.len());
     }
 
     /// 用 JSON 库读写 cache，按包名去重覆盖（避免无限膨胀）
@@ -157,17 +199,19 @@ pub mod cache {
             || pkg.starts_with(".dataservices")
     }
 
-    pub fn save(pkg: &str, all: &[(i32, String, Vec<(i32, String)>)], big: &str, mid: &str, little: &str) {
-        if is_blacklisted(pkg) { return; }
+    /// 构建单条缓存条目（线程按负载分级到 big/mid1/mid2/little）
+    fn build_entry(pkg: &str, all: &[(i32, String, Vec<(i32, String)>)], big: &str, mid1: &str, mid2: &str, little: &str) -> Option<json::JsonValue> {
         let mut big_names = Vec::new();
-        let mut mid_names = Vec::new();
+        let mut mid1_names = Vec::new();
+        let mut mid2_names = Vec::new();
         let mut lil_names = Vec::new();
-        let has_mid = !mid.is_empty();
+        let has_mid = !mid1.is_empty() || !mid2.is_empty();
         for (_, _, th) in all.iter().filter(|(_, n, _)| n == pkg) {
             for (_, comm) in th {
                 let load = est_load(comm);
                 if load >= 8 { big_names.push(comm.clone()); }
-                else if load >= 5 && has_mid { mid_names.push(comm.clone()); }
+                else if load >= 6 && !mid1.is_empty() { mid1_names.push(comm.clone()); }
+                else if load >= 5 && has_mid { mid2_names.push(comm.clone()); }
                 else { lil_names.push(comm.clone()); }
 
             }
@@ -175,7 +219,8 @@ pub mod cache {
 
         let mut comm_map: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
         for n in &big_names { comm_map.entry(big).or_default().push(n); }
-        for n in &mid_names { comm_map.entry(mid).or_default().push(n); }
+        for n in &mid1_names { comm_map.entry(mid1).or_default().push(n); }
+        for n in &mid2_names { comm_map.entry(mid2).or_default().push(n); }
 
         let mut entry = json::JsonValue::new_object();
         entry["friendly"] = json::JsonValue::String(format!("[auto] {}", pkg));
@@ -184,7 +229,7 @@ pub mod cache {
         entry["packages"] = pkgs;
         let mut cs = json::JsonValue::new_object();
         cs["other"] = json::JsonValue::String(little.to_string());
-        if !big_names.is_empty() || !mid_names.is_empty() {
+        if !big_names.is_empty() || !mid1_names.is_empty() || !mid2_names.is_empty() {
             let mut cm = json::JsonValue::new_object();
             for (cpus, ns) in &comm_map {
                 let mut arr = json::JsonValue::new_array();
@@ -194,7 +239,24 @@ pub mod cache {
             cs["comm"] = cm;
         }
         entry["cpuset"] = cs;
+        Some(entry)
+    }
 
+    /// 批量保存：一次读-去重-写，避免多个新应用时循环全量读写
+    pub fn save_batch(pkgs: &[String], all: &[(i32, String, Vec<(i32, String)>)], big: &str, mid1: &str, mid2: &str, little: &str) -> usize {
+        let mut entries = Vec::new();
+        for pkg in pkgs {
+            if is_blacklisted(pkg) { continue; }
+            if let Some(entry) = build_entry(pkg, all, big, mid1, mid2, little) {
+                entries.push(entry);
+            }
+        }
+        if entries.is_empty() { return 0; }
+        save_batch_entries(&mut entries);
+        entries.len()
+    }
+
+    fn save_batch_entries(entries: &mut Vec<json::JsonValue>) {
         let _ = fs::create_dir_all("/sdcard/Android/Aether");
         // 用 JSON 库读写，按包名去重
         let old = fs::read_to_string(FILE).unwrap_or_default();
@@ -203,18 +265,22 @@ pub mod cache {
         } else {
             json::parse(&old).unwrap_or(json::JsonValue::new_array())
         };
-        // 去重：过滤掉同名包名的老条目
+        let new_pkgs: std::collections::HashSet<String> = entries.iter()
+            .filter_map(|e| e["packages"][0].as_str().map(String::from)).collect();
+        // 去重：过滤掉与新增包同名的老条目
         let mut deduped = json::JsonValue::new_array();
         for e in arr.members() {
             let keep = match e["packages"][0].as_str() {
-                Some(old_pkg) => old_pkg != pkg,
+                Some(old_pkg) => !new_pkgs.contains(old_pkg),
                 None => true,
             };
             if keep {
                 let _ = deduped.push(e.clone());
             }
         }
-        let _ = deduped.push(entry);
+        for e in entries.drain(..) {
+            let _ = deduped.push(e);
+        }
         let _ = fs::write(FILE, json::stringify_pretty(deduped, 2).as_bytes());
     }
 

@@ -87,14 +87,24 @@ impl ProcCache {
         true
     }
 
-    /// 遍历 tasks 应用亲和性，返回 dead_tids
-    pub fn affinity_sync(&mut self, topo: &crate::cpuset::CpuTopology) -> Vec<i32> {
-        let dead_tids: Vec<i32> = self.tasks.iter().filter_map(|(tid, e)| {
-            if process::affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) { Some(*tid) } else { None }
-        }).collect();
+    /// 遍历 tasks 应用亲和性，返回 (本次成功绑定的线程数, dead_tids)
+    pub fn affinity_sync(&mut self, topo: &crate::cpuset::CpuTopology) -> (usize, Vec<i32>) {
+        let mut bound = 0usize;
+        let mut dead_tids = Vec::new();
+        for (tid, e) in self.tasks.iter() {
+            // getaffinity 已符合目标则跳过（零开销）
+            let already = crate::cpuset::CpuSet::get_affinity(*tid)
+                .map(|c| c == e.cpus).unwrap_or(false);
+            if already { continue; }
+            if process::affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) {
+                dead_tids.push(*tid);
+            } else {
+                bound += 1;
+            }
+        }
         for tid in &dead_tids {
             self.task_del(*tid);
         }
-        dead_tids
+        (bound, dead_tids)
     }
 }

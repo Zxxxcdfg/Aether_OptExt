@@ -10,6 +10,10 @@ pub struct AffinityResult {
 
 /// 线程规则 CPU 累加，无线程匹配走包级 fallback，仍无则返回 None
 pub fn thread_affinity(pkg: &str, thread: &str, cfg: &AppConfig, topo: &CpuTopology) -> Option<AffinityResult> {
+    // asoul 兼容：豁免包不参与任何绑定
+    if cfg.asoul_ignore.contains(pkg) {
+        return None;
+    }
     let mut cpus = CpuSet::new();
     let mut cpuset_dir = String::new();
     let mut matched = false;

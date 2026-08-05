@@ -79,16 +79,16 @@ pub fn probe(enable: bool) -> BpfCtx {
     if !enable { return BpfCtx::empty(); }
 
     let elf_data = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/ebpf_target.o"));
-    crate::info!("eBPF: 尝试加载 {} bytes", elf_data.len());
+    crate::info!("[ebpf] loading {} bytes", elf_data.len());
 
     let mut bpf = match EbpfLoader::new().load(&elf_data[..]) {
         Ok(b) => b,
-        Err(e) => { crate::info!("eBPF: EbpfLoader::load 失败 ({:?})", e); return BpfCtx::empty(); }
+        Err(e) => { crate::error!("[ebpf] EbpfLoader::load failed ({:?})", e); return BpfCtx::empty(); }
     };
 
     // tracepoint 偏移注入（必须先于 attach，避免首批事件读到空 map）
     if !offsets_inject(&mut bpf) {
-        crate::info!("eBPF: tracepoint 偏移注入失败, 回退 /proc 轮询");
+        crate::warn!("[ebpf] offset inject failed, fallback to /proc polling");
         return BpfCtx::empty();
     }
 
@@ -97,26 +97,26 @@ pub fn probe(enable: bool) -> BpfCtx {
         let prog = match bpf.program_mut(name) {
             Some(p) => p,
             None => {
-                if required { crate::info!("eBPF: 程序 '{}' 不存在", name); }
+                if required { crate::warn!("[ebpf] program '{}' not found", name); }
                 return false;
             }
         };
         let tp_prog: &mut TracePoint = match prog.try_into() {
             Ok(t) => t,
             Err(e) => {
-                if required { crate::info!("eBPF: 程序 '{}' try_into 失败 ({:?})", name, e); }
+                if required { crate::warn!("[ebpf] program '{}' try_into failed ({:?})", name, e); }
                 return false;
             }
         };
         if let Err(e) = tp_prog.load() {
-            if required { crate::info!("eBPF: 程序 '{}' BPF_PROG_LOAD 失败 ({:?})", name, e); }
+            if required { crate::warn!("[ebpf] program '{}' BPF_PROG_LOAD failed ({:?})", name, e); }
             return false;
         }
         if let Err(e) = tp_prog.attach(category, name) {
-            if required { crate::info!("eBPF: 程序 '{}' attach {}/{} 失败 ({:?})", name, category, name, e); }
+            if required { crate::warn!("[ebpf] program '{}' attach {}/{} failed ({:?})", name, category, name, e); }
             return false;
         }
-        if required { crate::info!("eBPF: 程序 '{}' 挂载成功", name); }
+        if required { crate::info!("[ebpf] program '{}' attached", name); }
         true
     };
 
@@ -126,7 +126,7 @@ pub fn probe(enable: bool) -> BpfCtx {
     attach(&mut bpf, "task_rename", "task", false); // rename 可选
 
     if !(fork_ok && exec_ok && exit_ok) {
-        crate::info!("eBPF: 必要 tracepoint 挂载失败, 回退 /proc 轮询");
+        crate::warn!("[ebpf] required tracepoints failed, fallback to /proc polling");
         return BpfCtx::empty();
     }
 
@@ -134,21 +134,21 @@ pub fn probe(enable: bool) -> BpfCtx {
     let (tx, rx) = mpsc::channel::<EbpfProcEvent>();
     let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if wakeup_fd < 0 {
-        crate::info!("eBPF: eventfd 创建失败");
+        crate::error!("[ebpf] eventfd creation failed");
         return BpfCtx::empty();
     }
 
     let ring_buf = match bpf.take_map("EVENTS") {
         Some(map) => match RingBuf::try_from(map) {
             Ok(rb) => rb,
-            Err(e) => { crate::info!("eBPF: EVENTS RingBuf 失败 ({:?})", e); return BpfCtx::empty(); }
+            Err(e) => { crate::error!("[ebpf] EVENTS RingBuf failed ({:?})", e); return BpfCtx::empty(); }
         },
-        None => { crate::info!("eBPF: take_map(EVENTS) 失败"); return BpfCtx::empty(); }
+        None => { crate::error!("[ebpf] take_map(EVENTS) failed"); return BpfCtx::empty(); }
     };
 
     let reader = thread::spawn(move || ebpf_reader(ring_buf, tx, wakeup_fd));
 
-    crate::info!("eBPF: 就绪 (exec={} fork={} exit={})", exec_ok, fork_ok, exit_ok);
+    crate::info!("[ebpf] ready (exec={} fork={} exit={})", exec_ok, fork_ok, exit_ok);
     BpfCtx { ok: true, event_rx: rx, bpf: Some(bpf), wakeup_fd, reader_thread: Some(reader) }
 }
 
@@ -243,7 +243,7 @@ fn tracepoint_parse(root: &str, category: &str, name: &str) -> Option<std::colle
 /// 解析本机 format 文件并注入 OFFSETS_MAP 索引 0
 fn offsets_inject(bpf: &mut Ebpf) -> bool {
     let Some(root) = tracefs_root() else {
-        crate::info!("eBPF: tracefs 不可用");
+        crate::warn!("[ebpf] tracefs unavailable");
         return false;
     };
 
@@ -257,24 +257,24 @@ fn offsets_inject(bpf: &mut Ebpf) -> bool {
         })
     })();
     let Some(offsets) = offsets else {
-        crate::info!("eBPF: tracepoint format 解析失败 [{}]", root);
+        crate::error!("[ebpf] tracepoint format parse failed [{}]", root);
         return false;
     };
 
     let Some(map) = bpf.map_mut("OFFSETS_MAP") else {
-        crate::info!("eBPF: 未找到 OFFSETS_MAP");
+        crate::error!("[ebpf] OFFSETS_MAP not found");
         return false;
     };
     let Ok(mut offsets_map) = Array::<_, EbpfOffsets>::try_from(map) else {
-        crate::info!("eBPF: OFFSETS_MAP 类型转换失败");
+        crate::error!("[ebpf] OFFSETS_MAP type conversion failed");
         return false;
     };
     if offsets_map.set(0, &offsets, 0).is_err() {
-        crate::info!("eBPF: OFFSETS_MAP 注入失败");
+        crate::error!("[ebpf] OFFSETS_MAP inject failed");
         return false;
     }
 
-    crate::info!("eBPF: 偏移注入 [{}] fork[child_pid={}, child_comm={}] rename[newcomm={}]",
+    crate::info!("[ebpf] offsets [{}] fork[child_pid={}, child_comm={}] rename[newcomm={}]",
         root, offsets.fork_child_pid, offsets.fork_child_comm, offsets.rename_newcomm);
     true
 }
@@ -307,16 +307,16 @@ pub fn comm_map_init(ctx: &mut BpfCtx, pkgs: &std::collections::HashSet<String>,
     let entries = comm_keys_build(pkgs.iter());
 
     if entries.len() > *comm_capacity as usize {
-        crate::info!("eBPF: 白名单容量不足 (需 {} > 现 {})", entries.len(), comm_capacity);
+        crate::warn!("[ebpf] whitelist capacity insufficient ({} > {})", entries.len(), comm_capacity);
         return true;
     }
 
     let Some(map) = bpf.map_mut("TARGET_COMM_MAP") else {
-        crate::info!("eBPF: 未找到 TARGET_COMM_MAP");
+        crate::error!("[ebpf] TARGET_COMM_MAP not found");
         return false;
     };
     let Ok(mut target_map) = BpfHashMap::<_, [u8; 8], u32>::try_from(map) else {
-        crate::info!("eBPF: TARGET_COMM_MAP 类型转换失败");
+        crate::error!("[ebpf] TARGET_COMM_MAP type conversion failed");
         return false;
     };
 
@@ -330,7 +330,7 @@ pub fn comm_map_init(ctx: &mut BpfCtx, pkgs: &std::collections::HashSet<String>,
         if target_map.insert(key, 1, 0).is_ok() { count += 1; }
     }
 
-    crate::info!("eBPF: 白名单已配置, {} 个包名 > {} 条匹配规则", pkgs.len(), count);
+    crate::info!("[ebpf] whitelist configured: {} pkgs, {} keys", pkgs.len(), count);
     false
 }
 

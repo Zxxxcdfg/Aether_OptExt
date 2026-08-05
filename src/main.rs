@@ -24,10 +24,10 @@ fn hot_reload(config_path: &str, cfg: &mut AppConfig) -> bool {
     if let Some(new_cfg) = AppConfig::load(config_path, &cfg.topo) {
         *cfg = new_cfg;
         cache::merge(&mut cfg.pkg_set, &mut cfg.rules);
-        info!("配置已热加载, 共 {} 条规则", cfg.rules.len());
+        info!("config reloaded, {} rules", cfg.rules.len());
         true
     } else {
-        info!("配置文件解析失败, 保持旧配置");
+        error!("config parse failed, keeping old config");
         false
     }
 }
@@ -188,6 +188,7 @@ fn proc_cache_sync(state: &mut ProcState, cfg: &AppConfig) -> bool {
 
             let Some(pkg) = process::read_cmdline(pid).or_else(|| process::tid_comm(pid)) else { continue };
             let base_pkg = pkg.split(':').next().unwrap_or(&pkg);
+            if cfg.asoul_ignore.contains(&pkg) || cfg.asoul_ignore.contains(base_pkg) { continue; }
             let interested = cfg.pkg_set.contains(&pkg) || cfg.pkg_set.contains(base_pkg)
                 || cfg.wild.iter().any(|w| fnmatch(w, &pkg));
             if !interested { continue; }
@@ -213,7 +214,6 @@ fn proc_cache_sync(state: &mut ProcState, cfg: &AppConfig) -> bool {
     state.last_proc_total = current_total;
     state.tracked_pids = new_tracked;
     state.force_affinity = true;
-    info!("proc: 缓存重建 ({} 进程)", scanned);
     true
 }
 
@@ -245,32 +245,37 @@ fn main() {
     }
     if interval < 1 { interval = 1; }
 
+    info!("===Welcome To Aether OptExt===");
     info!("CPU: {} cpuset={}", cpu::present(), Path::new("/dev/cpuset").exists());
 
     // CPU 拓扑 + BASE_CPUSET（绑核前必须初始化）
-    crate::common::set_base_cpuset("AppOpt");
+    crate::common::set_base_cpuset("OptExt");
     let topo = crate::cpuset::init_cpu_topo();
 
     let mut cfg = match AppConfig::load(&config_path, &topo) {
         Some(c) => c,
         None => { error!("配置加载失败"); return; }
     };
-    info!("已加载 {} 条规则", cfg.rules.len());
+    info!("rules loaded: {}", cfg.rules.len());
 
     cache::merge(&mut cfg.pkg_set, &mut cfg.rules);
-    info!("共 {} 条规则 (含缓存)", cfg.rules.len());
+    info!("total rules (with cache): {}", cfg.rules.len());
 
-    let (big, mid, little, topo) = cpu::detect();
-    info!("拓扑: {} (大核={} 中核={} 小核={})", topo, big, if mid.is_empty() { "无" } else { &mid }, little);
+    let (big, mid1, mid2, little, topo) = cpu::detect();
+    let mid_str = if mid1.is_empty() && mid2.is_empty() {
+        "无".to_string()
+    } else {
+        format!("{}{}{}", mid1, if !mid1.is_empty() && !mid2.is_empty() { "+" } else { "" }, mid2)
+    };
+    info!("topology: {} (big={} mid={} little={})", topo, big, mid_str, little);
 
-    process::init_cpuset();
 
     // 自身限定在小核运行
     if !little.is_empty() && little != "0" {
         let self_pid = std::process::id() as i32;
         let set = CpuSet::from_range(&little);
         let r = unsafe { libc::sched_setaffinity(self_pid, std::mem::size_of::<libc::cpu_set_t>(), &set as *const CpuSet as *const libc::cpu_set_t) };
-        if r != 0 { info!("自身绑核跳过 (errno={})", r); }
+        if r != 0 { warn!("self pin skipped (errno={})", r); }
     }
 
     // eBPF 初始化
@@ -286,36 +291,42 @@ fn main() {
 
     // 启动时自动分配 (两模式共用)
     let unknown = process::scan_unknown(&cfg.pkg_set, &cfg.wild);
-    let mut saved = false;
-    for (_, pkg, th) in &unknown {
-        if config::cache::is_blacklisted(pkg) { continue; }
-        info!("新应用: {} ({} 线程)", pkg, th.len());
-        cache::save(pkg, &unknown, &big, &mid, &little);
-        saved = true;
-    }
-    if saved {
+    let new_pkgs: Vec<String> = unknown.iter()
+        .filter(|(_, pkg, _)| !config::cache::is_blacklisted(pkg))
+        .filter(|(_, pkg, _)| !cfg.asoul_ignore.contains(pkg))
+        .map(|(_, pkg, _)| pkg.clone()).collect();
+    if !new_pkgs.is_empty() {
+        for pkg in &new_pkgs {
+            info!("new app detected: {}", pkg);
+        }
+        let n = cache::save_batch(&new_pkgs, &unknown, &big, &mid1, &mid2, &little);
         cache::merge(&mut cfg.pkg_set, &mut cfg.rules);
-        info!("自动分配完成: {} 个", unknown.len());
+        info!("auto-assign done: {} apps (saved {})", new_pkgs.len(), n);
     }
 
-    info!("启动 (模式: {})", if bpf_state.ok { "eBPF 事件驱动" } else { "proc 轮询" });
+    info!("mode: {}", if bpf_state.ok { "eBPF event-driven" } else { "proc polling" });
 
     // inotify 配置文件监听
     let mut inotify_fd = init_inotify(&config_path);
+    let mut last_reload = Instant::now() - Duration::from_secs(10);
 
     loop {
-        // 配置热加载检测 (每轮)
+        // 配置热加载检测 (每轮, 5s debounce 防重复触发)
         let mut config_changed = false;
-        if let Some(ev) = read_inotify(inotify_fd) {
-            if ev == 1 || ev == 2 {
-                config_changed = hot_reload(&config_path, &mut cfg);
-                if ev == 2 { rewatch_inotify(&config_path, &mut inotify_fd); }
-            }
-        }
-        if inotify_fd < 0 {
-            if let Ok(mt) = fs::metadata(&config_path).and_then(|m| m.modified()) {
-                if mt > cfg.mtime {
+        if last_reload.elapsed() >= Duration::from_secs(5) {
+            if let Some(ev) = read_inotify(inotify_fd) {
+                if ev == 1 || ev == 2 {
                     config_changed = hot_reload(&config_path, &mut cfg);
+                    last_reload = Instant::now();
+                    if ev == 2 { rewatch_inotify(&config_path, &mut inotify_fd); }
+                }
+            }
+            if !config_changed && inotify_fd < 0 {
+                if let Ok(mt) = fs::metadata(&config_path).and_then(|m| m.modified()) {
+                    if mt > cfg.mtime {
+                        config_changed = hot_reload(&config_path, &mut cfg);
+                        last_reload = Instant::now();
+                    }
                 }
             }
         }
@@ -350,10 +361,11 @@ fn main() {
 
             // 定期纠正亲和性 (每 3*interval 秒)
             if affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
-                let dead_tids = proc_state.cache.affinity_sync(&cfg.topo);
+                let (bound, dead_tids) = proc_state.cache.affinity_sync(&cfg.topo);
                 for tid in dead_tids {
                     bpf::applied_del(&mut bpf_state, tid);
                 }
+                if bound > 0 { info!("[ebpf] bound {} threads", bound); }
                 affinity_deadline = Instant::now();
             }
         } else {
@@ -367,26 +379,30 @@ fn main() {
 
             // 定期纠正亲和性 (每 3*interval 秒 或 进程数变化时)
             if proc_state.force_affinity || affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
-                let _dead = proc_state.cache.affinity_sync(&cfg.topo);
+                let (bound, _dead) = proc_state.cache.affinity_sync(&cfg.topo);
+                if bound > 0 { info!("[procfs] bound {} threads", bound); }
                 proc_state.force_affinity = false;
                 affinity_deadline = Instant::now();
             }
 
-            // 未知应用自动分配 (每 30 轮)
+            // 未知应用自动分配：每 120 轮(4 分钟) 或 进程数增长时
             cache_scan += 1;
-            if cache_scan >= 30 {
+            let mut si: libc::sysinfo = unsafe { std::mem::zeroed() };
+            let procs_now = if unsafe { libc::sysinfo(&mut si) } == 0 { si.procs as i32 } else { -1 };
+            if cache_scan >= 120 || (procs_now > proc_state.last_proc_count) {
                 cache_scan = 0;
                 let u = process::scan_unknown(&cfg.pkg_set, &cfg.wild);
-                let mut found = false;
-                for (_, pkg, th) in &u {
-                    if config::cache::is_blacklisted(pkg) { continue; }
-                    info!("新应用: {} ({} 线程)", pkg, th.len());
-                    cache::save(pkg, &u, &big, &mid, &little);
-                    found = true;
-                }
-                if found {
+                let new_pkgs: Vec<String> = u.iter()
+                    .filter(|(_, pkg, _)| !config::cache::is_blacklisted(pkg))
+                    .filter(|(_, pkg, _)| !cfg.asoul_ignore.contains(pkg))
+                    .map(|(_, pkg, _)| pkg.clone()).collect();
+                if !new_pkgs.is_empty() {
+                    for pkg in &new_pkgs {
+                        info!("new app detected: {}", pkg);
+                    }
+                    let n = cache::save_batch(&new_pkgs, &u, &big, &mid1, &mid2, &little);
                     cache::merge(&mut cfg.pkg_set, &mut cfg.rules);
-                    info!("缓存已更新");
+                    info!("cache updated ({} new apps)", n);
                 }
             }
 
@@ -407,7 +423,7 @@ fn init_inotify(path: &str) -> i32 {
             libc::IN_CLOSE_WRITE | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF)
     };
     if wd < 0 { unsafe { libc::close(fd); } return -1; }
-    info!("inotify: 监听配置文件变更 (fd={})", fd);
+    info!("inotify: watching config (fd={})", fd);
     fd
 }
 
@@ -441,8 +457,8 @@ fn rewatch_inotify(path: &str, fd: &mut i32) {
     if wd < 0 {
         unsafe { libc::close(*fd); }
         *fd = -1;
-        info!("inotify: 注册失败, 回退 mtime 轮询");
+        warn!("inotify: register failed, fallback to mtime polling");
     } else {
-        info!("inotify: 重新注册成功");
+        info!("inotify: re-registered");
     }
 }

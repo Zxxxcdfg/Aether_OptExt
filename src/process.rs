@@ -6,46 +6,9 @@ use std::fs;
 use crate::cpuset::CpuSet;
 use crate::config::{Rule, fnmatch};
 
-static CPUSET_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 记录已报告失败的 (tid, cpus)，同一组合只报一次
 static FAILED_ONCE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(i32, String)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-
-/// 初始化 cpuset 目录
-pub fn init_cpuset() {
-    if !std::path::Path::new("/dev/cpuset").exists() { return; }
-    let _ = fs::create_dir_all("/dev/cpuset/AppOpt");
-    let present = std::fs::read_to_string("/sys/devices/system/cpu/present").unwrap_or_default();
-    let _ = fs::write("/dev/cpuset/AppOpt/cpus", present.trim().as_bytes());
-    if let Ok(mems) = fs::read_to_string("/dev/cpuset/mems") {
-        let _ = fs::write("/dev/cpuset/AppOpt/mems", mems.trim().as_bytes());
-    }
-    CPUSET_OK.store(true, std::sync::atomic::Ordering::Release);
-}
-
-#[allow(dead_code)]
-fn ensure_cpuset(cpus: &str) {
-    if !CPUSET_OK.load(std::sync::atomic::Ordering::Acquire) { return; }
-    let dir = format!("/dev/cpuset/AppOpt/{}", cpus.replace(',', "."));
-    let _ = fs::create_dir_all(&dir);
-    let _ = fs::write(format!("{}/cpus", &dir), cpus.as_bytes());
-    if let Ok(mems) = fs::read_to_string("/dev/cpuset/mems") {
-        let _ = fs::write(format!("{}/mems", &dir), mems.trim().as_bytes());
-    }
-}
-
-#[allow(dead_code)]
-fn cpuset_add(tid: i32, cpus: &str) {
-    if !CPUSET_OK.load(std::sync::atomic::Ordering::Acquire) { return; }
-    let dir = format!("/dev/cpuset/AppOpt/{}", cpus.replace(',', "."));
-    let tasks = format!("{}/tasks", dir);
-    if let Err(e) = fs::write(&tasks, format!("{}\n", tid).as_bytes()) {
-        // ESRCH (os error 3) = 线程已退出, 静默跳过
-        if e.raw_os_error() != Some(3) {
-            crate::info!("cpuset_add tid={} cpus={} 写入失败 ({})", tid, cpus, e);
-        }
-    }
-}
 
 #[allow(dead_code)]
 pub fn scan(rules: &[Rule], set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String, Vec<(i32, String, CpuSet)>)> {
@@ -150,50 +113,6 @@ pub fn scan_unknown(set: &HashSet<String>, wild: &[String]) -> Vec<(i32, String,
     result
 }
 
-/// 应用绑核：sched_getaffinity 短路 → sched_setaffinity → cpuset 写入
-/// 返回 (进程数, 总线程数, 新增绑定数)
-#[allow(dead_code)]
-pub fn apply(procs: &[(i32, String, Vec<(i32, String, CpuSet)>)],
-    bound_set: &mut HashSet<(i32, String)>) -> (usize, usize, usize) {
-    let mut seen_cpus = HashSet::<String>::new();
-    let mut n = 0usize;
-    let mut new_set = HashSet::<(i32, String)>::new();
-    for (_, _, th) in procs {
-        for (tid, _, cpus) in th {
-            if cpus.is_zero() { continue; }
-            let cpus_str = cpus.to_range();
-            let key = (*tid, cpus_str.clone());
-
-            // sched_getaffinity 短路：已绑且 cpuset 已写则跳过
-            let already_bound = CpuSet::get_affinity(*tid).map(|curr| curr == *cpus).unwrap_or(false);
-            if already_bound {
-                new_set.insert(key);
-                continue;
-            }
-            if bound_set.contains(&key) { continue; }
-            n += 1;
-
-            if seen_cpus.insert(cpus_str.clone()) { ensure_cpuset(&cpus_str); }
-            // 先写 cpuset（cgroup 限制 CPU 范围），再设亲和性
-            cpuset_add(*tid, &cpus_str);
-            if let Err(e) = cpus.set_affinity(*tid) {
-                // ESRCH (os error 3) = 线程已退出, 静默跳过
-                if e.raw_os_error() != Some(3) {
-                    let mut seen = FAILED_ONCE.lock().unwrap_or_else(|p| p.into_inner());
-        if seen.insert((*tid, cpus_str.clone())) {
-            crate::info!("绑核失败 tid={} cpus={} ({}) (可能被系统 cpuset 管控限制)", tid, cpus_str, e);
-        }
-                }
-            }
-            new_set.insert(key);
-        }
-    }
-    for k in new_set { bound_set.insert(k); }
-    let total: usize = procs.iter().map(|(_, _, th)| th.len()).sum();
-    if n > 0 { info!("已绑核 {} 进程 {} 线程 (+{} 新)", procs.len(), total, n); }
-    (procs.len(), total, n)
-}
-
 /// 对单线程应用亲和性（参考项目逻辑）：getaffinity 短路 → 写 cpuset tasks → setaffinity
 /// cpuset_dir 为空时写 BASE_CPUSET（允许全部 present CPU），保证大核可绑
 /// 返回 true 表示 ESRCH 线程已退出
@@ -210,17 +129,31 @@ pub fn affinity_set(tid: i32, cpus: &CpuSet, cpuset_dir: &str, topo: &crate::cpu
         } else {
             format!("{}/{}/tasks", crate::common::base_cpuset(), cpuset_dir)
         };
-        let _ = fs::OpenOptions::new()
-            .append(true)
-            .open(&tasks_path)
-            .and_then(|mut f| f.write_all(tid_str.as_bytes()));
+        if fs::OpenOptions::new().append(true).open(&tasks_path)
+            .and_then(|mut f| f.write_all(tid_str.as_bytes())).is_err()
+        {
+            let mut seen = FAILED_ONCE.lock().unwrap_or_else(|p| p.into_inner());
+            if seen.insert((tid, format!("cpuset:{tasks_path}"))) {
+                crate::warn!("[procfs] cpuset write failed tid={} path={} ({})", tid, tasks_path,
+                    std::io::Error::last_os_error());
+            }
+        }
     }
 
     if let Err(e) = cpus.set_affinity(tid) {
         if e.raw_os_error() == Some(3) { return true; }  // ESRCH: 线程已退出
         let mut seen = FAILED_ONCE.lock().unwrap_or_else(|p| p.into_inner());
         if seen.insert((tid, cpus.to_range_string())) {
-            crate::info!("绑核失败 tid={} cpus={} ({})", tid, cpus.to_range_string(), e);
+            // 诊断：线程当前 cpuset 归属 + 允许的 CPU + 根 cpuset 范围
+            let cpuset_of = fs::read_to_string(format!("/proc/{}/cpuset", tid)).unwrap_or_default();
+            let allowed = CpuSet::get_affinity(tid)
+                .map(|s| s.to_range_string()).unwrap_or_default();
+            let root_cpus = fs::read_to_string("/dev/cpuset/cpus").unwrap_or_default();
+            let base_eff = fs::read_to_string(format!("{}/cpus", crate::common::base_cpuset()))
+                .unwrap_or_default();
+            crate::error!("[procfs] bind failed tid={} cpus={} ({}) cpuset={} allowed={} root_cpus={} base_eff={}",
+                tid, cpus.to_range_string(), e, cpuset_of.trim(), allowed,
+                root_cpus.trim(), base_eff.trim());
         }
     }
     false

@@ -307,8 +307,17 @@ pub fn init_cpu_topo() -> CpuTopology {
     topo.p_core = p;
     topo.hp_core = h;
 
+    // 诊断：online 与根 cpuset 范围（决定大核是否可绑）
+    let online = fs::read_to_string("/sys/devices/system/cpu/online")
+        .map(|s| s.trim().to_string()).unwrap_or_default();
+    let root_cpus = fs::read_to_string("/dev/cpuset/cpus")
+        .map(|s| s.trim().to_string()).unwrap_or_default();
+    crate::info!("self-check: present={} online={} root_cpus={}",
+        topo.present_str, online, root_cpus);
+
     let cpuset_path = CString::new("/dev/cpuset").expect("常量字符串无 NUL");
     if unsafe { libc::access(cpuset_path.as_ptr(), libc::F_OK) } != 0 {
+        crate::warn!("self-check: /dev/cpuset unavailable, skip BASE_CPUSET");
         return topo;
     }
 
@@ -318,7 +327,12 @@ pub fn init_cpu_topo() -> CpuTopology {
             unsafe { libc::open(base_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
         if topo.base_cpuset_fd != -1 {
             topo.cpuset_enabled = true;
+            crate::info!("self-check: {} ready cpus={}", base_cpuset(), topo.present_str);
+        } else {
+            crate::warn!("self-check: {} open failed errno={}", base_cpuset(), std::io::Error::last_os_error());
         }
+    } else {
+        crate::warn!("self-check: {} create failed (root cpuset may exclude big cores)", base_cpuset());
     }
 
     let mems_path = format!("{}/mems", base_cpuset());
