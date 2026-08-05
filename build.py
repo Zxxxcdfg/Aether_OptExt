@@ -117,7 +117,7 @@ def package():
 
     # 更新版本号
     now = datetime.now()
-    ver = now.strftime("%m%d-ReleasePreview")
+    ver = now.strftime("%m%d-Release")
     vc = int(now.strftime("%y%m%d"))
     prop = MODULE_DIR / "module.prop"
     prop.write_text(

@@ -9,6 +9,8 @@ pub struct TaskEntry {
     pub cpus: CpuSet,
     pub cpuset_dir: String,
     pub is_thread_rule: bool,
+    /// 上次绑定失败（非 ESRCH），跳过重复尝试避免无效 setaffinity 刷 CPU
+    pub failed: bool,
 }
 
 /// 双模式共用进程缓存：eBPF 事件驱动增量维护，proc 模式触发全量重建
@@ -83,28 +85,25 @@ impl ProcCache {
             cpus: result.cpus,
             cpuset_dir: result.cpuset_dir,
             is_thread_rule: result.is_thread_rule,
+            failed: false,
         });
         true
     }
 
-    /// 遍历 tasks 应用亲和性，返回 (本次成功绑定的线程数, dead_tids)
-    pub fn affinity_sync(&mut self, topo: &crate::cpuset::CpuTopology) -> (usize, Vec<i32>) {
-        let mut bound = 0usize;
+    /// 遍历 tasks 应用亲和性，返回 dead_tids
+    pub fn affinity_sync(&mut self, topo: &crate::cpuset::CpuTopology) -> Vec<i32> {
         let mut dead_tids = Vec::new();
-        for (tid, e) in self.tasks.iter() {
-            // getaffinity 已符合目标则跳过（零开销）
-            let already = crate::cpuset::CpuSet::get_affinity(*tid)
-                .map(|c| c == e.cpus).unwrap_or(false);
-            if already { continue; }
+        for (tid, e) in self.tasks.iter_mut() {
+            if e.failed { continue; }  // 上次失败（cpuset 限制），跳过无效重试
             if process::affinity_set(*tid, &e.cpus, &e.cpuset_dir, topo) {
                 dead_tids.push(*tid);
             } else {
-                bound += 1;
+                e.failed = true;
             }
         }
         for tid in &dead_tids {
             self.task_del(*tid);
         }
-        (bound, dead_tids)
+        dead_tids
     }
 }

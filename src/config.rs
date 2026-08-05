@@ -188,7 +188,7 @@ pub mod cache {
     /// 用 JSON 库读写 cache，按包名去重覆盖（避免无限膨胀）
     /// 黑名单: 已知无需记忆的系统服务
     pub fn is_blacklisted(pkg: &str) -> bool {
-        pkg.ends_with(":widgetProvider") || pkg.ends_with(":searchDataService")
+        if pkg.ends_with(":widgetProvider") || pkg.ends_with(":searchDataService")
             || pkg.ends_with(":coreService") || pkg.ends_with(":cognitionService")
             || pkg.ends_with(":bert") || pkg.ends_with(":bertAlgo")
             || pkg.ends_with(":privacy") || pkg.ends_with(":kit7")
@@ -197,6 +197,21 @@ pub mod cache {
             || pkg.starts_with("com.qualcomm.") || pkg.starts_with(".qti")
             || pkg.starts_with(".qms") || pkg.starts_with(".cacert")
             || pkg.starts_with(".dataservices")
+        {
+            return true;
+        }
+        // 系统应用前缀（各厂商系统组件，不参与自动分配）
+        pkg.starts_with("com.android.") || pkg.starts_with("android.")
+            || pkg.starts_with("com.google.android.") || pkg.starts_with("com.miui.")
+            || pkg.starts_with("com.xiaomi.") || pkg.starts_with("com.qti.")
+            || pkg.starts_with("com.qualcomm.") || pkg.starts_with("vendor.")
+            || pkg.starts_with("com.oplus.") || pkg.starts_with("com.oneplus.")
+            || pkg.starts_with("com.coloros.") || pkg.starts_with("com.heytap.")
+            || pkg.starts_with("com.vivo.") || pkg.starts_with("com.huawei.")
+            || pkg.starts_with("com.honor.") || pkg.starts_with("com.samsung.")
+            || pkg.starts_with("com.sec.android.") || pkg.starts_with("com.meizu.")
+            || pkg.starts_with("org.codeaurora.") || pkg.starts_with("com.miui.securitycenter")
+            || pkg.starts_with("com.lbe.") || pkg.starts_with("com.miui.powerkeeper")
     }
 
     /// 构建单条缓存条目（线程按负载分级到 big/mid1/mid2/little）

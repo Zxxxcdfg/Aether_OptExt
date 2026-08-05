@@ -37,15 +37,6 @@ impl CpuSet {
         }
     }
 
-    pub fn is_zero(&self) -> bool {
-        self.bits.iter().all(|&w| w == 0)
-    }
-
-    /// 转换为范围字符串（别名）
-    pub fn to_range(&self) -> String {
-        self.to_range_string()
-    }
-
     /// 从 "0-3,6-7" 解析
     pub fn from_range(spec: &str) -> CpuSet {
         parse_cpu_ranges(spec, None)
@@ -140,7 +131,8 @@ pub fn parse_cpu_ranges(spec: &str, present: Option<&CpuSet>) -> CpuSet {
     if spec.is_empty() {
         return set;
     }
-    for part in spec.split(',') {
+    // 支持逗号、空格及混合分隔（customize.sh 检测的 related_cpus 可能是 "0 1 2 3 4 5"）
+    for part in spec.split(|c: char| c == ',' || c == ' ' || c == '\t') {
         let part = part.trim();
         if part.is_empty() {
             continue;

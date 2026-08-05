@@ -713,7 +713,8 @@
     {
       "friendly": "荒野乱斗",
       "packages": [
-        "com.tencent.tmgp.supercell.brawlstars"
+        "com.tencent.tmgp.supercell.brawlstars",
+        "com.supercell.brawlstars"
       ],
       "cpuset": {
         "other": "{e_core},{p_core}",
@@ -3156,7 +3157,8 @@
     {
       "friendly": "阅读(OSS)",
       "packages": [
-        "io.legado.app.release"
+        "io.legado.app.release",
+        "io.legado.play.release"
       ],
       "cpuset": {
         "other": "{e_core},{p_core}",
@@ -3194,7 +3196,10 @@
     {
       "friendly": "chrome",
       "packages": [
-        "com.android.chrome"
+        "com.android.chrome",
+        "com.chrome.dev",
+        "com.chrome.canary",
+        "com.chrome.beta"
       ],
       "cpuset": {
         "other": "{e_core},{p_core}",
@@ -3215,7 +3220,10 @@
     {
       "friendly": "edge",
       "packages": [
-        "com.microsoft.emmx"
+        "com.microsoft.emmx",
+        "com.microsoft.emmx.dev",
+        "com.microsoft.emmx.canary",
+        "com.microsoft.emmx.beta"
       ],
       "cpuset": {
         "other": "{e_core},{p_core}",

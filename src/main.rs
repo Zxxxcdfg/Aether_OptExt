@@ -178,7 +178,6 @@ fn proc_cache_sync(state: &mut ProcState, cfg: &AppConfig) -> bool {
     state.cache.clear();
     let mut new_tracked: std::collections::HashSet<i32> = std::collections::HashSet::new();
     let mut current_total = 0i32;
-    let mut scanned = 0usize;
 
     if let Ok(dir) = fs::read_dir("/proc") {
         for entry in dir.flatten() {
@@ -205,7 +204,6 @@ fn proc_cache_sync(state: &mut ProcState, cfg: &AppConfig) -> bool {
             if any {
                 state.cache.pkgs.insert(pid, (pkg, htr));
                 new_tracked.insert(pid);
-                scanned += 1;
             }
         }
     }
@@ -361,11 +359,10 @@ fn main() {
 
             // 定期纠正亲和性 (每 3*interval 秒)
             if affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
-                let (bound, dead_tids) = proc_state.cache.affinity_sync(&cfg.topo);
+                let dead_tids = proc_state.cache.affinity_sync(&cfg.topo);
                 for tid in dead_tids {
                     bpf::applied_del(&mut bpf_state, tid);
                 }
-                if bound > 0 { info!("[ebpf] bound {} threads", bound); }
                 affinity_deadline = Instant::now();
             }
         } else {
@@ -379,8 +376,7 @@ fn main() {
 
             // 定期纠正亲和性 (每 3*interval 秒 或 进程数变化时)
             if proc_state.force_affinity || affinity_deadline.elapsed() >= Duration::from_secs(3 * interval) {
-                let (bound, _dead) = proc_state.cache.affinity_sync(&cfg.topo);
-                if bound > 0 { info!("[procfs] bound {} threads", bound); }
+                let _dead = proc_state.cache.affinity_sync(&cfg.topo);
                 proc_state.force_affinity = false;
                 affinity_deadline = Instant::now();
             }

@@ -25,6 +25,7 @@ if [ -f "$MODPATH/gamelist" ]; then
 fi
 
 # 按 cpufreq 最高频分组检测 CPU 簇，输出 E_CORE/P1_CORE/P2_CORE/HP_CORE
+# 输出统一压缩为 range 格式（如 0-5,6-7），避免列出每个核心
 eval "$(for policy in /sys/devices/system/cpu/cpufreq/policy[0-9]*; do
     [ -d "$policy" ] || continue
     freq=$(cat "$policy/cpuinfo_max_freq" 2>/dev/null)
@@ -32,15 +33,47 @@ eval "$(for policy in /sys/devices/system/cpu/cpufreq/policy[0-9]*; do
     [ -z "$freq" ] || [ -z "$cpus" ] && continue
     echo "$freq:$cpus"
 done | sort -t: -k1,1n | awk -F: '
+    function normalize(s,    out,n,parts,i,p,lo,hi,j) {
+        n = split(s, parts, /[ ,]+/)
+        out = ""
+        for (i = 1; i <= n; i++) {
+            p = parts[i]
+            if (p == "") continue
+            if (p ~ /-/) {
+                split(p, r, /-/)
+                lo = r[1] + 0; hi = r[2] + 0
+                for (j = lo; j <= hi; j++) out = out (out == "" ? "" : ",") j
+            } else {
+                out = out (out == "" ? "" : ",") p + 0
+            }
+        }
+        return out
+    }
+    function compress(s,    n,a,i,j,t,out,start,prev,first) {
+        n = split(s, a, /,/)
+        for (i = 1; i <= n; i++) a[i] = a[i] + 0
+        for (i = 1; i <= n; i++)
+            for (j = i + 1; j <= n; j++)
+                if (a[j] < a[i]) { t = a[i]; a[i] = a[j]; a[j] = t }
+        if (n == 0) return ""
+        out = ""; start = a[1]; prev = a[1]; first = 1
+        for (i = 2; i <= n; i++) {
+            if (a[i] == prev + 1) { prev = a[i]; continue }
+            out = out (first ? "" : ",") (start == prev ? start : start "-" prev)
+            first = 0; start = a[i]; prev = a[i]
+        }
+        out = out (first ? "" : ",") (start == prev ? start : start "-" prev)
+        return out
+    }
     $1 in freq { freq[$1] = freq[$1] "," $2; next }
     { freq[$1] = $2; order[++k] = $1 }
     END {
         n = k
         if (n == 0) { print "E_CORE= P1_CORE= P2_CORE= HP_CORE="; exit }
-        e  = freq[order[1]]
-        hp = freq[order[n]]
-        p1 = (n >= 3) ? freq[order[2]] : ""
-        p2 = (n >= 4) ? freq[order[3]] : ""
+        e  = compress(normalize(freq[order[1]]))
+        hp = compress(normalize(freq[order[n]]))
+        p1 = (n >= 3) ? compress(normalize(freq[order[2]])) : ""
+        p2 = (n >= 4) ? compress(normalize(freq[order[3]])) : ""
         if (hp == "") hp = e
         print "E_CORE=\"" e "\""
         print "P1_CORE=\"" p1 "\""
