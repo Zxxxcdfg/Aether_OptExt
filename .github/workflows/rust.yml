@@ -1,22 +1,38 @@
-name: Rust
+name: Build Aether Module
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-env:
-  CARGO_TERM_COLOR: always
+  workflow_dispatch:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        
+    - name: Setup Rust
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        target: aarch64-linux-android
+        
+    - name: Install NDK
+      run: |
+        wget https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
+        unzip android-ndk-r26d-linux.zip
+        echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
+        
+    - name: Build Module
+      run: |
+        python build.py
+        
+    - name: Upload Module
+      uses: actions/upload-artifact@v4
+      with:
+        name: Aether-OptExt-Module
+        path: out/*.zip
