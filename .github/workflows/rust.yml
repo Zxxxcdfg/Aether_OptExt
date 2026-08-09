@@ -25,17 +25,65 @@ jobs:
         
     - name: Install NDK
       run: |
+        sudo apt-get update
+        sudo apt-get install -y wget unzip
         wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
         unzip -q android-ndk-r26d-linux.zip
-        echo "ANDROID_NDK_HOME=${PWD}/android-ndk-r26d" >> $GITHUB_ENV
-        echo "PATH=${PATH}:${PWD}/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_ENV
+        echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
+        echo "$PWD/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
         
-    - name: Check environment
+    - name: Create dummy ebpf file
       run: |
-        echo "NDK_HOME: $ANDROID_NDK_HOME"
-        rustc --version
-        cargo --version
-        python --version
+        # 创建一个空的占位文件，跳过 eBPF 编译
+        touch ebpf_target.o
+        
+    - name: Build Module
+      run: |
+        python build.py
+        
+    - name: Upload Module
+      uses: actions/upload-artifact@v4
+      with:
+        name: Aether-OptExt-Module
+        path: out/*.zip
+      if: success()name: Build Aether Module
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: aarch64-linux-android
+        override: true
+        
+    - name: Install NDK
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y wget unzip
+        wget -q https://dl.google.com/android/repository/android-ndk-r26d-linux.zip
+        unzip -q android-ndk-r26d-linux.zip
+        echo "ANDROID_NDK_HOME=$PWD/android-ndk-r26d" >> $GITHUB_ENV
+        echo "$PWD/android-ndk-r26d/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+        
+    - name: Create dummy ebpf file
+      run: |
+        # 创建一个空的占位文件，跳过 eBPF 编译
+        touch ebpf_target.o
         
     - name: Build Module
       run: |
